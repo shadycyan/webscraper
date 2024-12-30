@@ -29,6 +29,13 @@ type page struct {
 	reason    string
 }
 
+const (
+	httpTimeout  = 5 * time.Second
+	expectedType = "text/html"
+	greenColor   = "\033[32m"
+	resetColor   = "\033[0m"
+)
+
 func main() {
 	baseURL := flag.String("url", "", "URL to scrape")
 	flag.Parse()
@@ -77,21 +84,18 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 	html, err := readPage(rawCurrentURL)
 	if err != nil {
 		var contentTypeErr *contentTypeError
-
 		if !errors.As(err, &contentTypeErr) {
 			p.isDead = true
 			p.reason = err.Error()
 		}
 
 		cfg.pages.Set(normalizedURL, p)
-
 		return
 	}
 
 	cfg.pages.Set(normalizedURL, p)
 
 	isSame := cfg.baseURL.Host == uri.Host
-
 	if !isSame {
 		return
 	}
@@ -106,7 +110,7 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 }
 
 func readPage(rawURL string) (string, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: httpTimeout}
 
 	resp, err := client.Get(rawURL)
 	if err != nil {
@@ -125,7 +129,6 @@ func readPage(rawURL string) (string, error) {
 		return "", fmt.Errorf("failed to parse media type: %w", err)
 	}
 
-	expectedType := "text/html"
 	if mediaType != expectedType {
 		return "", &contentTypeError{contentType: contentType, expectedType: expectedType}
 	}
@@ -147,7 +150,6 @@ func printReport(pages []page) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
 	defer w.Flush()
 
-	greenColor := "\033[32m"
 	fmt.Fprintf(w, "%s\n", greenColor)
 
 	fmt.Fprintf(w, "Page\tLink\n")
@@ -156,6 +158,5 @@ func printReport(pages []page) {
 		fmt.Fprintf(w, "%s\t%s\n", page.sourceURL, page.url)
 	}
 
-	resetColor := "\033[0m"
 	fmt.Fprintf(w, "%s\n", resetColor)
 }
