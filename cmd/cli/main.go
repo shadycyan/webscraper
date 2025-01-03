@@ -16,6 +16,7 @@ import (
 
 	"github.com/shadycyan/webscraper/internal/link"
 	"github.com/shadycyan/webscraper/internal/safemap"
+	"golang.org/x/sync/singleflight"
 )
 
 type config struct {
@@ -31,6 +32,8 @@ type page struct {
 	isDead    bool
 	reason    string
 }
+
+var requestGroup singleflight.Group
 
 const (
 	httpTimeout  = 5 * time.Second
@@ -127,15 +130,19 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 }
 
 func (cfg *config) readPage(rawURL string) (string, error) {
-	client := &http.Client{Timeout: httpTimeout}
-
 	cfg.sem <- struct{}{}
 	defer func() { <-cfg.sem }()
 
-	resp, err := client.Get(rawURL)
+	result, err, _ := requestGroup.Do(rawURL, func() (interface{}, error) {
+		client := &http.Client{Timeout: httpTimeout}
+		return client.Get(rawURL)
+	})
+
 	if err != nil {
 		return "", fmt.Errorf("failed to make request: %w", err)
 	}
+
+	resp := result.(*http.Response)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
