@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 type config struct {
 	baseURL *url.URL
 	pages   *safemap.SafeMap[string, page]
+	wg      *sync.WaitGroup
+	sem     chan struct{}
 }
 
 type page struct {
@@ -38,6 +41,7 @@ const (
 
 func main() {
 	baseURL := flag.String("url", "", "URL to scrape")
+	maxRequests := flag.Int("max-requests", 10, "Maximum number of concurrent requests")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -51,15 +55,23 @@ func main() {
 		return
 	}
 
-	cfg := config{
+	config := config{
 		baseURL: parsedBaseURL,
 		pages:   safemap.New[string, page](),
+		wg:      &sync.WaitGroup{},
+		sem:     make(chan struct{}, *maxRequests),
 	}
 
-	cfg.processPage(*baseURL, *baseURL)
+	config.wg.Add(1)
+	go func() {
+		defer config.wg.Done()
+		config.processPage(*baseURL, *baseURL)
+	}()
+
+	config.wg.Wait()
 
 	deadLinks := slices.DeleteFunc(
-		cfg.pages.Values(),
+		config.pages.Values(),
 		func(p page) bool { return p.isDead == false },
 	)
 
@@ -81,7 +93,7 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 
 	p := page{url: rawCurrentURL, sourceURL: sourceURL}
 
-	html, err := readPage(rawCurrentURL)
+	html, err := cfg.readPage(rawCurrentURL)
 	if err != nil {
 		var contentTypeErr *contentTypeError
 		if !errors.As(err, &contentTypeErr) {
@@ -105,12 +117,20 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 	fmt.Printf("found %v\n", links)
 
 	for _, link := range links {
-		cfg.processPage(link, rawCurrentURL)
+		cfg.wg.Add(1)
+
+		go func() {
+			defer cfg.wg.Done()
+			cfg.processPage(link, rawCurrentURL)
+		}()
 	}
 }
 
-func readPage(rawURL string) (string, error) {
+func (cfg *config) readPage(rawURL string) (string, error) {
 	client := &http.Client{Timeout: httpTimeout}
+
+	cfg.sem <- struct{}{}
+	defer func() { <-cfg.sem }()
 
 	resp, err := client.Get(rawURL)
 	if err != nil {
