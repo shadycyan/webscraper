@@ -4,9 +4,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
+	"log"
 	"mime"
-	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -14,16 +13,23 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/playwright-community/playwright-go"
 	"github.com/shadycyan/webscraper/internal/link"
 	"github.com/shadycyan/webscraper/internal/safemap"
 	"golang.org/x/sync/singleflight"
 )
 
 type config struct {
-	baseURL *url.URL
-	pages   *safemap.SafeMap[string, page]
-	wg      *sync.WaitGroup
-	sem     chan struct{}
+	baseURL     *url.URL
+	pages       *safemap.SafeMap[string, page]
+	wg          *sync.WaitGroup
+	sem         chan struct{}
+	pw          *playwright.Playwright
+	browser     playwright.Browser
+	context     playwright.BrowserContext
+	printReason bool
+	timeout     time.Duration
+	maxPages    int
 }
 
 type page struct {
@@ -36,15 +42,17 @@ type page struct {
 var requestGroup singleflight.Group
 
 const (
-	httpTimeout  = 5 * time.Second
 	expectedType = "text/html"
 	greenColor   = "\033[32m"
 	resetColor   = "\033[0m"
 )
 
 func main() {
-	baseURL := flag.String("url", "", "URL to scrape")
-	maxRequests := flag.Int("max-requests", 10, "Maximum number of concurrent requests")
+	baseURL := flag.String("url", "", "Base URL to start scraping from")
+	maxConcurrency := flag.Int("max-concurrency", 5, "Maximum number of concurrent requests")
+	maxPages := flag.Int("max-pages", 0, "Maximum number of pages to crawl")
+	printReason := flag.Bool("print-reason", false, "Print the reason for dead links in the report")
+	timeout := flag.Duration("timeout", 15*time.Second, "Timeout duration for each request (e.g., 15s, 1m)")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -58,11 +66,32 @@ func main() {
 		return
 	}
 
+	pw, err := playwright.Run()
+	if err != nil {
+		log.Fatalf("could not start playwright: %v", err)
+	}
+	browser, err := pw.Chromium.Launch()
+	if err != nil {
+		log.Fatalf("could not launch browser: %v", err)
+	}
+	context, err := browser.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent: playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.135 Safari/537.36"),
+	})
+	if err != nil {
+		log.Fatalf("could not create context: %v", err)
+	}
+
 	config := config{
-		baseURL: parsedBaseURL,
-		pages:   safemap.New[string, page](),
-		wg:      &sync.WaitGroup{},
-		sem:     make(chan struct{}, *maxRequests),
+		baseURL:     parsedBaseURL,
+		pages:       safemap.New[string, page](),
+		wg:          &sync.WaitGroup{},
+		sem:         make(chan struct{}, *maxConcurrency),
+		pw:          pw,
+		browser:     browser,
+		context:     context,
+		printReason: *printReason,
+		timeout:     *timeout,
+		maxPages:    *maxPages,
 	}
 
 	config.wg.Add(1)
@@ -78,10 +107,19 @@ func main() {
 		func(p page) bool { return p.isDead == false },
 	)
 
-	printReport(deadLinks)
+	config.printReport(deadLinks)
+
+	close(config.sem)
+
+	browser.Close()
+	pw.Stop()
 }
 
 func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
+	if cfg.maxPages != 0 && len(cfg.pages.Keys()) > cfg.maxPages {
+		return
+	}
+
 	fmt.Println("checking", rawCurrentURL)
 
 	normalizedURL, uri, err := link.NormalizeURL(rawCurrentURL)
@@ -117,8 +155,6 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 
 	links, err := link.Parse(html, rawCurrentURL)
 
-	fmt.Printf("found %v\n", links)
-
 	for _, link := range links {
 		cfg.wg.Add(1)
 
@@ -129,27 +165,57 @@ func (cfg *config) processPage(rawCurrentURL, sourceURL string) {
 	}
 }
 
+type response struct {
+	resp playwright.Response
+	page playwright.Page
+}
+
 func (cfg *config) readPage(rawURL string) (string, error) {
 	cfg.sem <- struct{}{}
 	defer func() { <-cfg.sem }()
 
 	result, err, _ := requestGroup.Do(rawURL, func() (interface{}, error) {
-		client := &http.Client{Timeout: httpTimeout}
-		return client.Get(rawURL)
+		// if !cfg.browser.IsConnected() {
+		// 	fmt.Fprintln(os.Stderr, "browser is NOT connected!")
+		// 	cfg.browser, _ = cfg.pw.Chromium.Launch()
+		// }
+
+		page, err := cfg.context.NewPage()
+		if err != nil {
+			return nil, fmt.Errorf("could not create page: %v", err)
+		}
+
+		resp, err := page.Goto(rawURL, playwright.PageGotoOptions{
+			Timeout: playwright.Float(cfg.timeout.Seconds() * 1000),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("could not goto: %v", err)
+		}
+
+		if nil == resp {
+			return nil, fmt.Errorf("response is nil for URL: %s", rawURL)
+		}
+
+		return response{resp: resp, page: page}, nil
 	})
 
 	if err != nil {
 		return "", fmt.Errorf("failed to make request: %w", err)
 	}
 
-	resp := result.(*http.Response)
-	defer resp.Body.Close()
+	response := result.(response)
+	resp := response.resp
+	page := response.page
+	defer page.Close()
 
-	if resp.StatusCode >= 400 {
-		return "", &statusCodeError{statusCode: resp.StatusCode, statusText: http.StatusText(resp.StatusCode)}
+	if resp.Status() >= 400 {
+		return "", &statusCodeError{statusCode: resp.Status(), statusText: resp.StatusText()}
 	}
 
-	contentType := resp.Header.Get("Content-Type")
+	contentType, exists := resp.Headers()["Content-Type"]
+	if !exists {
+		contentType = resp.Headers()["content-type"]
+	}
 
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil {
@@ -160,29 +226,38 @@ func (cfg *config) readPage(rawURL string) (string, error) {
 		return "", &contentTypeError{contentType: contentType, expectedType: expectedType}
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
+	body, err := resp.Body()
 
 	return string(body), nil
 }
 
-func printReport(pages []page) {
+func (cfg *config) printReport(pages []page) {
 	if len(pages) == 0 {
-		fmt.Println("did't find any dead links")
+		fmt.Println("didn't find any dead links")
 		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	defer w.Flush()
+	defer func() {
+		if err := w.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to flush writer: %v\n", err)
+		}
+	}()
 
 	fmt.Fprintf(w, "%s\n", greenColor)
 
-	fmt.Fprintf(w, "Page\tLink\n")
+	fmt.Fprintf(w, "Page\tLink")
+	if cfg.printReason {
+		fmt.Fprintf(w, "\tReason")
+	}
+	fmt.Fprintf(w, "\n")
 
 	for _, page := range pages {
-		fmt.Fprintf(w, "%s\t%s\n", page.sourceURL, page.url)
+		fmt.Fprintf(w, "%s\t%s", page.sourceURL, page.url)
+		if cfg.printReason {
+			fmt.Fprintf(w, "\t%s", page.reason)
+		}
+		fmt.Fprintf(w, "\n")
 	}
 
 	fmt.Fprintf(w, "%s\n", resetColor)
