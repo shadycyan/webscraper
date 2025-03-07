@@ -175,32 +175,27 @@ func (cfg *config) readPage(rawURL string) (string, error) {
 	defer func() { <-cfg.sem }()
 
 	result, err, _ := requestGroup.Do(rawURL, func() (interface{}, error) {
-		// if !cfg.browser.IsConnected() {
-		// 	fmt.Fprintln(os.Stderr, "browser is NOT connected!")
-		// 	cfg.browser, _ = cfg.pw.Chromium.Launch()
-		// }
-
 		page, err := cfg.context.NewPage()
 		if err != nil {
-			return nil, fmt.Errorf("could not create page: %v", err)
+			return nil, fmt.Errorf("could not create a new browser page: %v", err)
 		}
 
 		resp, err := page.Goto(rawURL, playwright.PageGotoOptions{
 			Timeout: playwright.Float(cfg.timeout.Seconds() * 1000),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("could not goto: %v", err)
+			return nil, fmt.Errorf("request failed for %s: %v", rawURL, err)
 		}
 
 		if nil == resp {
-			return nil, fmt.Errorf("response is nil for URL: %s", rawURL)
+			return nil, fmt.Errorf("no response received from %s", rawURL)
 		}
 
 		return response{resp: resp, page: page}, nil
 	})
 
 	if err != nil {
-		return "", fmt.Errorf("failed to make request: %w", err)
+		return "", fmt.Errorf("error while loading %s: %w", rawURL, err)
 	}
 
 	response := result.(response)
